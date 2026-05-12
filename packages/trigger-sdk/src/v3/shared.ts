@@ -534,7 +534,8 @@ export function triggerAndWait<TTask extends AnyTask>(
 export function triggerAndSubscribe<TTask extends AnyTask>(
   id: TaskIdentifier<TTask>,
   payload: TaskPayload<TTask>,
-  options?: TriggerAndSubscribeOptions
+  options?: TriggerAndSubscribeOptions,
+  requestOptions?: TriggerApiRequestOptions
 ): TaskRunPromise<TaskIdentifier<TTask>, TaskOutput<TTask>> {
   return new TaskRunPromise<TaskIdentifier<TTask>, TaskOutput<TTask>>((resolve, reject) => {
     triggerAndSubscribe_internal<TaskIdentifier<TTask>, TaskPayload<TTask>, TaskOutput<TTask>>(
@@ -542,7 +543,8 @@ export function triggerAndSubscribe<TTask extends AnyTask>(
       id,
       payload,
       undefined,
-      options
+      options,
+      requestOptions
     )
       .then((result) => {
         resolve(result);
@@ -2534,7 +2536,8 @@ async function triggerAndSubscribe_internal<TIdentifier extends string, TPayload
   id: TIdentifier,
   payload: TPayload,
   parsePayload?: SchemaParseFn<TPayload>,
-  options?: TriggerAndSubscribeOptions
+  options?: TriggerAndSubscribeOptions,
+  requestOptions?: TriggerApiRequestOptions
 ): Promise<TaskRunResult<TIdentifier, TOutput>> {
   const ctx = taskContext.ctx;
 
@@ -2542,7 +2545,7 @@ async function triggerAndSubscribe_internal<TIdentifier extends string, TPayload
     throw new Error("triggerAndSubscribe can only be used from inside a task.run()");
   }
 
-  const apiClient = apiClientManager.clientOrThrow();
+  const apiClient = apiClientManager.clientOrThrow(requestOptions?.clientConfig);
 
   const parsedPayload = parsePayload ? await parsePayload(payload) : payload;
   const payloadPacket = await stringifyIO(parsedPayload);

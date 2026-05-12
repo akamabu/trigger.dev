@@ -870,10 +870,19 @@ function input<TData>(opts: { id: string }): RealtimeDefinedInputStream<TData> {
             }
           }
 
-          // Skip suspend if requested — return as if timed out
+          // Skip suspend if requested — return a real WaitpointTimeoutError
+          // so the result shape matches the cold-phase `self.wait()` path
+          // below. Callers that check `if (!result.ok)` work the same as
+          // before; callers that do `throw result.error` get a useful error
+          // instead of `undefined`.
           if (options.skipSuspend) {
             span.setAttribute("wait.resolved", "skipped");
-            return { ok: false as const, error: undefined };
+            return {
+              ok: false as const,
+              error: new WaitpointTimeoutError(
+                "Idle timeout elapsed and skipSuspend is set"
+              ),
+            };
           }
 
           // Fire onSuspend callback before entering cold phase
