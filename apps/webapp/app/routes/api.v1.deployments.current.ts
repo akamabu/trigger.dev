@@ -8,8 +8,7 @@ export const loader = createLoaderApiRoute(
     corsStrategy: "none",
     authorization: {
       action: "read",
-      resource: () => ({ deployments: "current" }),
-      superScopes: ["read:deployments", "read:all", "admin"],
+      resource: () => ({ type: "deployments", id: "current" }),
     },
     findResource: async (_params, auth) => {
       const promotion = await $replica.workerDeploymentPromotion.findFirst({
@@ -35,7 +34,7 @@ export const loader = createLoaderApiRoute(
         },
       });
 
-      return promotion?.deployment ?? null;
+      return promotion?.deployment ?? undefined;
     },
   },
   async ({ resource: deployment }) => {

@@ -8,7 +8,7 @@ import {
   resolveSessionByIdOrExternalId,
 } from "~/services/realtime/sessions.server";
 import { getRealtimeStreamInstance } from "~/services/realtime/v1StreamsGlobal.server";
-import { createLoaderApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { anyResource, createLoaderApiRoute } from "~/services/routeBuilders/apiBuilder.server";
 
 const ParamsSchema = z.object({
   session: z.string(),
@@ -58,15 +58,18 @@ const loader = createLoaderApiRoute(
     },
     authorization: {
       action: "read",
+      // Multi-key: the channel is addressable by the URL key, the row's
+      // friendlyId, and (if set) externalId. Type-level `read:sessions`
+      // matches any of them; `read:all` / `admin` bypass via the JWT
+      // ability's wildcard branches.
       resource: ({ row, addressingKey }) => {
         const ids = new Set<string>([addressingKey]);
         if (row) {
           ids.add(row.friendlyId);
           if (row.externalId) ids.add(row.externalId);
         }
-        return { sessions: [...ids] };
+        return anyResource([...ids].map((id) => ({ type: "sessions", id })));
       },
-      superScopes: ["read:sessions", "read:all", "admin"],
     },
   },
   async ({ params, authentication, resource, searchParams }) => {
