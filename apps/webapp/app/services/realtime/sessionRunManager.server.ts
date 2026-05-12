@@ -237,7 +237,14 @@ export async function ensureRunForSession(
   }
 
   if (fresh.currentRunId) {
-    const probe = await getRunStatusAndFriendlyId(fresh.currentRunId);
+    // Same read-after-write reason as the `fresh` reload above: the winner
+    // just wrote `currentRunId` on the writer, so probe the writer too —
+    // the replica may not have the run row yet, and a missed probe forces
+    // another trigger+recurse until `ENSURE_RUN_FOR_SESSION_MAX_ATTEMPTS`.
+    const probe = await prisma.taskRun.findFirst({
+      where: { id: fresh.currentRunId },
+      select: { status: true, friendlyId: true },
+    });
     if (probe && !isFinalRunStatus(probe.status)) {
       return { runId: fresh.currentRunId, triggered: false };
     }

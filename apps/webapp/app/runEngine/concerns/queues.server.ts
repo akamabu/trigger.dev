@@ -213,14 +213,21 @@ export class DefaultQueueManager implements QueueManager {
 
     const defaultQueueName = `task/${taskId}`;
 
-    // When caller provides both a queue override and a per-trigger TTL,
-    // we don't need any DB queries - the per-trigger TTL takes precedence
-    if (overriddenQueueName && body.options?.ttl !== undefined) {
-      return { queueName: overriddenQueueName, taskTtl: undefined };
-    }
+    // Even when the caller provides both a queue override and a
+    // per-trigger TTL, we still need to fetch the task so `triggerSource`
+    // (which becomes `taskKind` on annotations and replicates to
+    // ClickHouse) is populated. Without it, AGENT/SCHEDULED runs hitting
+    // this path get stamped as STANDARD and disappear from the
+    // dashboard's `Source` filter. Mirrors the locked-worker fix above
+    // — `taskTtl` is harmless in the returned value because the call
+    // site coalesces `body.options.ttl ?? taskTtl`.
 
-    // Find the current worker for the environment
-    const worker = await findCurrentWorkerFromEnvironment(environment, this.prisma);
+    // Find the current worker for the environment. Replica is fine here —
+    // the adjacent `backgroundWorkerTask` lookups below already use
+    // `replicaPrisma` (replica lag for "just deployed" is bounded the same
+    // way for both queries; reading the worker from the writer and the
+    // task from the replica would only widen the inconsistency window).
+    const worker = await findCurrentWorkerFromEnvironment(environment, this.replicaPrisma);
 
     if (!worker) {
       logger.debug("Failed to get queue name: No worker found", {

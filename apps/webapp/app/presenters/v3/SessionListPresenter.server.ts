@@ -159,9 +159,17 @@ export class SessionListPresenter {
       "SessionListPresenter.findCurrentRuns",
       async (span) => {
         span.setAttribute("currentRunIds.count", currentRunIds.length);
+        // Scope by projectId + runtimeEnvironmentId — Session.currentRunId
+        // is a plain string column without an FK, so a stale or corrupted
+        // pointer could surface another tenant's run. The list query above
+        // is already env-scoped; the run lookup needs the same fence.
         return currentRunIds.length > 0
           ? this.replica.taskRun.findMany({
-              where: { id: { in: currentRunIds } },
+              where: {
+                id: { in: currentRunIds },
+                projectId,
+                runtimeEnvironmentId: environmentId,
+              },
               select: { id: true, friendlyId: true },
             })
           : [];

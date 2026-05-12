@@ -2593,45 +2593,57 @@ async function triggerAndSubscribe_internal<TIdentifier extends string, TPayload
 
       // Optionally cancel the child run when the abort signal fires (default: true)
       const cancelOnAbort = options?.cancelOnAbort !== false;
+      let onAbort: (() => void) | undefined;
       if (options?.signal && cancelOnAbort) {
-        const onAbort = () => {
-          apiClient.cancelRun(response.id).catch(() => {});
-        };
         if (options.signal.aborted) {
           await apiClient.cancelRun(response.id).catch(() => {});
-          throw new Error("Aborted");
+          throw new DOMException("Aborted", "AbortError");
         }
+        onAbort = () => {
+          apiClient.cancelRun(response.id).catch(() => {});
+        };
+        // `{ once: true }` auto-removes the listener on abort, but if the
+        // run completes normally the listener stays attached and pins
+        // `apiClient` + `response.id` until the signal is GC'd. Long-lived
+        // signals shared across many calls accumulate dead listeners; the
+        // `finally` below removes the listener on every exit path.
         options.signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      for await (const run of apiClient.subscribeToRun(response.id, {
-        closeOnComplete: true,
-        signal: options?.signal,
-        skipColumns: ["payload"],
-      })) {
-        if (run.isSuccess) {
-          // run.output from subscribeToRun is already deserialized
-          return {
-            ok: true as const,
-            id: response.id,
-            taskIdentifier: id as TIdentifier,
-            output: run.output as TOutput,
-          };
-        }
-        if (run.isFailed || run.isCancelled) {
-          const error = new Error(run.error?.message ?? `Task ${id} failed (${run.status})`);
-          if (run.error?.name) error.name = run.error.name;
+      try {
+        for await (const run of apiClient.subscribeToRun(response.id, {
+          closeOnComplete: true,
+          signal: options?.signal,
+          skipColumns: ["payload"],
+        })) {
+          if (run.isSuccess) {
+            // run.output from subscribeToRun is already deserialized
+            return {
+              ok: true as const,
+              id: response.id,
+              taskIdentifier: id as TIdentifier,
+              output: run.output as TOutput,
+            };
+          }
+          if (run.isFailed || run.isCancelled) {
+            const error = new Error(run.error?.message ?? `Task ${id} failed (${run.status})`);
+            if (run.error?.name) error.name = run.error.name;
 
-          return {
-            ok: false as const,
-            id: response.id,
-            taskIdentifier: id as TIdentifier,
-            error,
-          };
+            return {
+              ok: false as const,
+              id: response.id,
+              taskIdentifier: id as TIdentifier,
+              error,
+            };
+          }
+        }
+
+        throw new Error(`Task ${id}: subscription ended without completion`);
+      } finally {
+        if (onAbort && options?.signal) {
+          options.signal.removeEventListener("abort", onAbort);
         }
       }
-
-      throw new Error(`Task ${id}: subscription ended without completion`);
     },
     {
       kind: SpanKind.PRODUCER,
