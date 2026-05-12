@@ -1526,7 +1526,7 @@ describe("mockChatAgent", () => {
       const harness = mockChatAgent(agent, {
         chatId: "oom-retry-skip",
         taskContext: {
-          ctx: { attempt: { number: 2, startedAt: new Date(0), status: "EXECUTING" } },
+          ctx: { attempt: { number: 2, startedAt: new Date(0) } },
         },
       });
       try {
