@@ -136,10 +136,29 @@ export async function ensureRunForSession(
   // override `trigger`/`metadata` etc. `sessionId` is always set so the
   // agent doesn't need a control-plane round-trip to look up the session
   // friendlyId from `payload.chatId`.
+  // Continuation overrides strip the basePayload's first-run-only fields
+  // so a continuation run doesn't inherit a stale boot payload. The Session
+  // row's `triggerConfig.basePayload` is captured at create-time and used
+  // verbatim for every Run we trigger; if the customer included `message`
+  // / `messages` / `trigger: "submit-message"` to make the FIRST run boot
+  // straight into a first turn (via `chat.createStartSessionAction`), those
+  // values stick around and get replayed on every continuation. With
+  // `continuation: true` and `message`/`messages` cleared, the SDK boot
+  // path enters its continuation-wait branch and waits for the next
+  // session.in record before running a turn.
   const continuationOverrides: Record<string, unknown> = {
     sessionId: session.friendlyId,
     ...(priorDeadRunFriendlyId !== undefined
-      ? { continuation: true, previousRunId: priorDeadRunFriendlyId }
+      ? {
+          continuation: true,
+          previousRunId: priorDeadRunFriendlyId,
+          // Clear sticky boot-payload fields so the new run waits for the
+          // next session.in record instead of re-processing whatever was
+          // in the original `createStartSessionAction({ basePayload })`.
+          message: undefined,
+          messages: undefined,
+          trigger: undefined,
+        }
       : {}),
   };
   const mergedPayloadOverrides: Record<string, unknown> = {
@@ -360,11 +379,19 @@ export async function swapSessionRun(
   // every swap is a deliberate handoff from `callingRunId` (which owned
   // prior conversation state) to a fresh run. Merged AFTER caller-supplied
   // overrides so a caller can't accidentally unset them.
+  //
+  // Sticky boot-payload fields (`message` / `messages` / `trigger`) are
+  // cleared here for the same reason as in `ensureRunForSession`: the
+  // Session's basePayload is captured at create-time and replays on every
+  // continuation if not stripped. See the comment in `ensureRunForSession`.
   const mergedPayloadOverrides: Record<string, unknown> = {
     ...(payloadOverrides ?? {}),
     sessionId: session.friendlyId,
     continuation: true,
     previousRunId: callingRunFriendlyId,
+    message: undefined,
+    messages: undefined,
+    trigger: undefined,
   };
 
   const config = SessionTriggerConfigSchema.parse(session.triggerConfig);
