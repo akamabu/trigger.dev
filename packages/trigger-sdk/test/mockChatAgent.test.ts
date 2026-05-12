@@ -1438,4 +1438,105 @@ describe("mockChatAgent", () => {
       }
     });
   });
+
+  describe("onChatStart fires exactly once per chat", () => {
+    // Contract: `onChatStart` fires only on the chat's very first user
+    // message ever. It does NOT re-fire on continuation runs (post-`endRun`,
+    // post-waitpoint-timeout, post-`chat.requestUpgrade`) or on OOM-retry
+    // attempts. Customers put one-time chat-setup work there (Chat DB row
+    // create, user-context init) and that contract relies on once-per-chat
+    // semantics.
+
+    it("fires on a fresh first message (baseline)", async () => {
+      const onChatStart = vi.fn();
+      const onTurnStart = vi.fn();
+      const model = new MockLanguageModelV3({
+        doStream: async () => ({ stream: textStream("hi") }),
+      });
+      const agent = chat.agent({
+        id: "onChatStart-gate.fresh-baseline",
+        onChatStart,
+        onTurnStart,
+        run: async ({ messages, signal }) =>
+          streamText({ model, messages, abortSignal: signal }),
+      });
+      const harness = mockChatAgent(agent, { chatId: "fresh-baseline" });
+      try {
+        await harness.sendMessage(userMessage("hello"));
+        await new Promise((r) => setTimeout(r, 20));
+        expect(onChatStart).toHaveBeenCalledTimes(1);
+        expect(onTurnStart).toHaveBeenCalledTimes(1);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("does NOT fire on a continuation run (continuation: true at boot)", async () => {
+      const onChatStart = vi.fn();
+      const onTurnStart = vi.fn();
+      const model = new MockLanguageModelV3({
+        doStream: async () => ({ stream: textStream("ok") }),
+      });
+      const agent = chat.agent({
+        id: "onChatStart-gate.continuation-skip",
+        // hydrateMessages registered so the boot path doesn't try to read a
+        // snapshot the harness doesn't have — keeps the continuation-wait
+        // branch clean.
+        hydrateMessages: async ({ incomingMessages }) => incomingMessages,
+        onChatStart,
+        onTurnStart,
+        run: async ({ messages, signal }) =>
+          streamText({ model, messages, abortSignal: signal }),
+      });
+      const harness = mockChatAgent(agent, {
+        chatId: "continuation-skip",
+        // `continuation: true` auto-selects `mode: "continuation"` —
+        // boots with `trigger` omitted (mirroring what the server's
+        // continuation overrides produce in production) and enters the
+        // SDK's continuation-wait branch.
+        continuation: true,
+        previousRunId: "run_test_prior",
+      });
+      try {
+        // The continuation-wait branch parks until the first session.in
+        // message arrives — sending one wakes it and runs turn 0.
+        await harness.sendMessage(userMessage("first user message of this run"));
+        await new Promise((r) => setTimeout(r, 20));
+        expect(onChatStart).not.toHaveBeenCalled();
+        expect(onTurnStart).toHaveBeenCalledTimes(1);
+      } finally {
+        await harness.close();
+      }
+    });
+
+    it("does NOT fire on an OOM-retry attempt (ctx.attempt.number > 1)", async () => {
+      const onChatStart = vi.fn();
+      const onTurnStart = vi.fn();
+      const model = new MockLanguageModelV3({
+        doStream: async () => ({ stream: textStream("ok") }),
+      });
+      const agent = chat.agent({
+        id: "onChatStart-gate.oom-retry-skip",
+        hydrateMessages: async ({ incomingMessages }) => incomingMessages,
+        onChatStart,
+        onTurnStart,
+        run: async ({ messages, signal }) =>
+          streamText({ model, messages, abortSignal: signal }),
+      });
+      const harness = mockChatAgent(agent, {
+        chatId: "oom-retry-skip",
+        taskContext: {
+          ctx: { attempt: { number: 2, startedAt: new Date(0), status: "EXECUTING" } },
+        },
+      });
+      try {
+        await harness.sendMessage(userMessage("hi"));
+        await new Promise((r) => setTimeout(r, 20));
+        expect(onChatStart).not.toHaveBeenCalled();
+        expect(onTurnStart).toHaveBeenCalledTimes(1);
+      } finally {
+        await harness.close();
+      }
+    });
+  });
 });

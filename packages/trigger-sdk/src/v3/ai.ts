@@ -3585,6 +3585,11 @@ export type PreloadEvent<TClientData = unknown> = {
 
 /**
  * Event passed to the `onChatStart` callback.
+ *
+ * Fires exactly once per chat, on the very first user message of the chat's
+ * lifetime. Does NOT fire on continuation runs (post-`endRun`,
+ * post-waitpoint-timeout, `chat.requestUpgrade`) or on OOM-retry attempts —
+ * those are runs of an already-started chat.
  */
 export type ChatStartEvent<TClientData = unknown> = {
   /** Task run context — same as `task({ run })` second-argument `ctx`. */
@@ -3592,14 +3597,10 @@ export type ChatStartEvent<TClientData = unknown> = {
   /** The unique identifier for the chat session. */
   chatId: string;
   /**
-   * The initial model-ready messages for this conversation.
-   *
-   * On a fresh chat this is empty (or just the seed-message for head-start).
-   * On a continuation — including idle-suspend resume and OOM retry — this
-   * already reflects the FULL prior conversation history loaded from the
-   * runtime's durable snapshot + `session.out` replay (or whatever
-   * `hydrateMessages` returned). The wire never re-ships that history; the
-   * runtime rebuilds it before `onChatStart` fires.
+   * The initial model-ready messages for this conversation. Typically just
+   * the first user message (or empty if `chat.headStart` is in play and the
+   * seed message is supplied elsewhere). Since this hook only fires for the
+   * chat's very first message, there's no prior history to load here.
    */
   messages: ModelMessage[];
   /** Custom data from the frontend (passed via `metadata` on `sendMessage()` or the transport). */
@@ -3608,9 +3609,17 @@ export type ChatStartEvent<TClientData = unknown> = {
   runId: string;
   /** A scoped access token for this chat run. Persist this for frontend reconnection. */
   chatAccessToken: string;
-  /** Whether this run is continuing an existing chat (previous run timed out or was cancelled). False for brand new chats. */
+  /**
+   * @deprecated Always `false` — `onChatStart` no longer fires on continuation
+   * runs. Kept for backward compatibility; remove your `continuation` checks
+   * from `onChatStart` and rely on the contract (this hook fires exactly once
+   * per chat, on the very first message).
+   */
   continuation: boolean;
-  /** The run ID of the previous run (only set when `continuation` is true). */
+  /**
+   * @deprecated Always `undefined` — `onChatStart` no longer fires on
+   * continuation runs.
+   */
   previousRunId?: string;
   /** Whether this run was preloaded before the first message. */
   preloaded: boolean;
@@ -3845,6 +3854,24 @@ export type ChatSuspendEvent<TClientData = unknown, TUIM extends UIMessage = UIM
     clientData?: TClientData;
   }
   | {
+    /**
+     * Suspend is happening on a continuation run that booted with no incoming
+     * message (post-`endRun`, post-waitpoint-timeout, etc.) and is waiting
+     * for the next session.in record before running any turn. Distinct from
+     * `phase: "preload"` — the chat already started; `onPreload` has not
+     * fired and will not fire on this run.
+     */
+    phase: "continuation";
+    /** Task run context. */
+    ctx: TaskRunContext;
+    /** The chat session ID. */
+    chatId: string;
+    /** The Trigger.dev run ID. */
+    runId: string;
+    /** Custom data from the frontend. */
+    clientData?: TClientData;
+  }
+  | {
     /** Suspend is happening after a completed turn, waiting for the next message. */
     phase: "turn";
     /** Task run context. */
@@ -3871,6 +3898,23 @@ export type ChatResumeEvent<TClientData = unknown, TUIM extends UIMessage = UIMe
   | {
     /** First message arrived after preload suspension. */
     phase: "preload";
+    /** Task run context. */
+    ctx: TaskRunContext;
+    /** The chat session ID. */
+    chatId: string;
+    /** The Trigger.dev run ID. */
+    runId: string;
+    /** Custom data from the frontend. */
+    clientData?: TClientData;
+  }
+  | {
+    /**
+     * First message arrived after continuation-wait suspension. Distinct
+     * from `phase: "preload"` — the chat already started; this is a new
+     * run picking up after a prior run ended (`endRun`, waitpoint timeout,
+     * etc.).
+     */
+    phase: "continuation";
     /** Task run context. */
     ctx: TaskRunContext;
     /** The chat session ID. */
@@ -4043,9 +4087,16 @@ export type ChatAgentOptions<
   onPreload?: (event: PreloadEvent<inferSchemaOut<TClientDataSchema>>) => Promise<void> | void;
 
   /**
-   * Called on the first turn (turn 0) of a new run, before the `run` function executes.
+   * Called exactly once per chat, on the very first user message of the
+   * chat's lifetime. Does NOT fire on continuation runs (post-`endRun`,
+   * post-waitpoint-timeout, `chat.requestUpgrade`) or on OOM-retry attempts —
+   * those are runs of an already-started chat.
    *
-   * Use this to create the chat record in your database when a new conversation starts.
+   * Use this for one-time chat-setup work — creating the Chat DB row,
+   * initializing per-chat in-memory state, minting resources tied to the
+   * chat's lifetime. Safe to assume no prior history exists here.
+   *
+   * For per-turn work, use `onTurnStart`.
    *
    * @example
    * ```ts
@@ -5057,6 +5108,105 @@ function chatAgent<
           } as ChatTaskWirePayload<TUIMessage, inferSchemaIn<TClientDataSchema>>;
         }
 
+        // Continuation-wait: a continuation run (post-`endRun`,
+        // post-waitpoint-timeout, etc.) booted with no incoming message.
+        // The server strips the Session's basePayload `message` /
+        // `messages` / `trigger` on continuation so a stale one-shot boot
+        // payload doesn't re-fire on every resume. Without a real first
+        // message, we have nothing to process at turn 0 — wait silently
+        // for the next session.in record before entering the turn loop.
+        // Unlike preload, `onPreload` does NOT fire (the chat already
+        // started); `onChatStart` will fire on the first turn with
+        // `continuation: true, preloaded: false`.
+        if (
+          !preloaded &&
+          payload.continuation === true &&
+          !payload.message &&
+          payload.trigger !== "handover-prepare" &&
+          payload.trigger !== "close"
+        ) {
+          if (activeSpan) {
+            activeSpan.setAttribute("chat.continuationWaiting", true);
+          }
+
+          const continuationClientData = (
+            parseClientData ? await parseClientData(payload.metadata) : payload.metadata
+          ) as inferSchemaOut<TClientDataSchema>;
+
+          const effectiveIdleTimeout =
+            idleTimeoutInSeconds ?? payload.idleTimeoutInSeconds;
+          const effectiveTurnTimeout =
+            (metadata.get(TURN_TIMEOUT_METADATA_KEY) as string | undefined) ?? turnTimeout;
+
+          const continuationResult = await messagesInput.waitWithIdleTimeout({
+            idleTimeoutInSeconds: effectiveIdleTimeout,
+            timeout: effectiveTurnTimeout,
+            spanName: "waiting for first message (continuation)",
+            onSuspend: onChatSuspend
+              ? async () => {
+                  await tracer.startActiveSpan(
+                    "onChatSuspend()",
+                    async () => {
+                      await onChatSuspend({
+                        phase: "continuation",
+                        ctx,
+                        chatId: payload.chatId,
+                        runId: ctx.run.id,
+                        clientData: continuationClientData,
+                      });
+                    },
+                    {
+                      attributes: {
+                        [SemanticInternalAttributes.STYLE_ICON]: "task-hook-onComplete",
+                        [SemanticInternalAttributes.COLLAPSED]: true,
+                        "chat.id": payload.chatId,
+                        "chat.suspend.phase": "continuation",
+                      },
+                    }
+                  );
+                }
+              : undefined,
+            onResume: onChatResume
+              ? async () => {
+                  await tracer.startActiveSpan(
+                    "onChatResume()",
+                    async () => {
+                      await onChatResume({
+                        phase: "continuation",
+                        ctx,
+                        chatId: payload.chatId,
+                        runId: ctx.run.id,
+                        clientData: continuationClientData,
+                      });
+                    },
+                    {
+                      attributes: {
+                        [SemanticInternalAttributes.STYLE_ICON]: "task-hook-onStart",
+                        [SemanticInternalAttributes.COLLAPSED]: true,
+                        "chat.id": payload.chatId,
+                        "chat.resume.phase": "continuation",
+                      },
+                    }
+                  );
+                }
+              : undefined,
+          });
+
+          if (!continuationResult.ok) {
+            // Timed out waiting for the customer's next message — exit.
+            return;
+          }
+
+          currentWirePayload = continuationResult.output as ChatTaskWirePayload<
+            TUIMessage,
+            inferSchemaIn<TClientDataSchema>
+          >;
+
+          if (currentWirePayload.trigger === "close") {
+            return;
+          }
+        }
+
         for (let turn = 0; turn < maxTurns; turn++) {
           try {
               // Extract turn-level context before entering the span. Slim
@@ -5666,8 +5816,15 @@ function chatAgent<
                     }
                   }
 
-                  // Fire onChatStart on the first turn
-                  if (turn === 0 && onChatStart) {
+                  // Fire onChatStart on the very first message of a chat
+                  // (across the chat's entire lifetime). Gated on
+                  // `!couldHavePriorState` so it does NOT re-fire on
+                  // continuation runs (post-`endRun`, post-waitpoint-timeout)
+                  // or on OOM-retry attempts. Customers put one-time
+                  // chat-setup work in `onChatStart` (e.g. create the Chat
+                  // DB row, init user context) and that contract relies on
+                  // it firing exactly once per chat.
+                  if (turn === 0 && onChatStart && !couldHavePriorState) {
                     await tracer.startActiveSpan(
                       "onChatStart()",
                       async () => {

@@ -73,11 +73,24 @@ export type MockChatAgentOptions = {
   preload?: boolean;
   /**
    * Initial trigger the agent boots with. Defaults to `"preload"` (or
-   * `"submit-message"` when `preload: false`). Use `"handover-prepare"`
-   * to drive the chat.handover wait branch — call `sendHandover()` /
-   * `sendHandoverSkip()` to dispatch the handover signal.
+   * `"submit-message"` when `preload: false`, or `"continuation"` when
+   * `continuation: true`).
+   *
+   * - `"preload"` — fresh chat preloaded via `transport.preload`. Fires
+   *   `onPreload`, waits for the first message.
+   * - `"submit-message"` — fresh chat with the first message in the boot
+   *   payload (the `chat.createStartSessionAction({ basePayload: { message } })`
+   *   pattern). Goes straight to turn 0.
+   * - `"continuation"` — new run picking up an existing session after the
+   *   prior run ended (`chat.endRun`, waitpoint timeout, `chat.requestUpgrade`).
+   *   Boots with `trigger` omitted and `continuation: true` — mirrors what
+   *   the server's `ensureRunForSession` / `swapSessionRun` produces in
+   *   production. The SDK enters its continuation-wait branch; `onPreload`
+   *   and `onChatStart` do NOT fire on this run.
+   * - `"handover-prepare"` — drives the chat.handover wait branch; call
+   *   `sendHandover()` / `sendHandoverSkip()` to dispatch the handover signal.
    */
-  mode?: "preload" | "submit-message" | "handover-prepare";
+  mode?: "preload" | "submit-message" | "handover-prepare" | "continuation";
   /**
    * Pre-seed the snapshot the agent reads at run boot. The runtime's
    * snapshot read is replaced with one that returns this snapshot
@@ -88,6 +101,26 @@ export type MockChatAgentOptions = {
    * See plan section B.3 for the boot orchestration spec.
    */
   snapshot?: ChatSnapshotV1;
+  /**
+   * Set `payload.continuation = true` on the initial wire payload. Used
+   * to simulate a continuation-run boot (a new run picking up after a
+   * prior run on the same session ended via `chat.endRun`, waitpoint
+   * timeout, or `chat.requestUpgrade`).
+   *
+   * Setting this without specifying `mode` auto-selects `mode:
+   * "continuation"` — the SDK boot path enters its continuation-wait
+   * branch and waits silently on `session.in` for the first user
+   * message. `onPreload` and `onChatStart` do NOT fire on this run.
+   *
+   * Defaults to `false` (fresh run).
+   */
+  continuation?: boolean;
+  /**
+   * Set `payload.previousRunId` on the initial wire payload. Forwarded
+   * to `onChatStart` / `onTurnStart` and used by the boot gate as a
+   * prior-state signal. Usually paired with `continuation: true`.
+   */
+  previousRunId?: string;
   /**
    * Callback that runs **before** the agent's `run()` is invoked, with a
    * `set` function for pre-seeding locals. Use this to inject server-side
@@ -279,8 +312,15 @@ export function mockChatAgent(
   // The agent opens the session with `payload.sessionId ?? payload.chatId`.
   // We pass no sessionId, so it falls back to chatId.
   const sessionId = chatId;
-  const mode: "preload" | "submit-message" | "handover-prepare" =
-    options.mode ?? (options.preload === false ? "submit-message" : "preload");
+  // `continuation: true` without an explicit mode auto-selects "continuation"
+  // — the canonical shape for a continuation-run boot.
+  const mode: "preload" | "submit-message" | "handover-prepare" | "continuation" =
+    options.mode ??
+    (options.continuation === true
+      ? "continuation"
+      : options.preload === false
+        ? "submit-message"
+        : "preload");
   const clientData = options.clientData;
 
   const taskEntry = resourceCatalog.getTask(agent.id);
@@ -395,10 +435,22 @@ export function mockChatAgent(
     async (drivers) => {
       runSignal = new AbortController();
 
+      // For `mode: "continuation"`, omit `trigger` from the wire payload —
+      // mirrors what the server's `ensureRunForSession` / `swapSessionRun`
+      // produces (the continuation overrides clear `trigger` so the SDK
+      // boot path falls into the continuation-wait branch instead of
+      // re-firing the basePayload's stale first-run trigger). `continuation:
+      // true` is set unconditionally for this mode so the boot path's
+      // continuation-wait condition matches.
+      const isContinuationMode = mode === "continuation";
       const initialPayload: ChatWirePayload = {
         chatId,
-        trigger: mode,
+        ...(isContinuationMode
+          ? { trigger: undefined as never, continuation: true }
+          : { trigger: mode }),
         metadata: clientData,
+        ...(!isContinuationMode && options.continuation ? { continuation: true } : {}),
+        ...(options.previousRunId ? { previousRunId: options.previousRunId } : {}),
       };
 
       sendSessionInput = drivers.sessions.in.send;
