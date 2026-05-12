@@ -677,8 +677,16 @@ export class SessionInputChannel {
         }
 
         if (options.skipSuspend) {
+          // Match the cold-phase `self.wait()` result shape below so any
+          // caller that does `throw result.error` gets a real error
+          // instead of `undefined`.
           span.setAttribute("wait.resolved", "skipped");
-          return { ok: false as const, error: undefined };
+          return {
+            ok: false as const,
+            error: new WaitpointTimeoutError(
+              "Idle timeout elapsed and skipSuspend is set"
+            ),
+          };
         }
 
         if (options.onSuspend) {
